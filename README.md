@@ -1,6 +1,12 @@
 Nexus Air Quality Monitor
 
+Nexus Air Quality Monitor
 
+Real-Time Air Quality Monitoring and Next-Hour PM2.5 Prediction
+
+Live Application: https://airqualitymonitor-nt6eiyzxfsdvjebkravbo2.streamlit.app/
+
+GitHub Repository: https://github.com/bhuvana-mellimpudi/air_quality_monitor
 
 Real-Time Air Quality Monitoring and Next-Hour PM2.5 Prediction
 
