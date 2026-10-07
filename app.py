@@ -1,9 +1,11 @@
 import streamlit as st
-import requests
 import pandas as pd
 import numpy as np
+import requests
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from google import genai
+
 
 # ============================================================
 # PAGE SETUP
@@ -18,11 +20,12 @@ st.set_page_config(
 st.title("🌍 Nexus Air Quality Monitor")
 st.write(
     "Real-time air-quality monitoring, historical analysis, "
-    "next-hour PM2.5 prediction, AQI estimation and recommendations."
+    "next-hour PM2.5 prediction, AQI estimation and AI-assisted recommendations."
 )
 
+
 # ============================================================
-# CPCB-STYLE AQI FUNCTIONS
+# AQI FUNCTIONS
 # ============================================================
 
 AQI_BREAKPOINTS = {
@@ -107,16 +110,6 @@ def get_aqi_category(aqi):
         return "Severe"
 
 
-def get_pollution_status(value, good_limit, moderate_limit):
-    if pd.isna(value):
-        return "⚪ Data unavailable"
-    if value <= good_limit:
-        return "🟢 Good"
-    elif value <= moderate_limit:
-        return "🟡 Moderate"
-    return "🔴 High"
-
-
 def get_aqi_message(aqi):
     if aqi <= 50:
         return "Air quality is generally good. Normal outdoor activities are suitable."
@@ -129,6 +122,78 @@ def get_aqi_message(aqi):
     elif aqi <= 400:
         return "Very poor air quality. Avoid prolonged outdoor exposure where possible."
     return "Severe air pollution. Outdoor exposure should be minimized."
+
+
+def get_pollution_status(value, good_limit, moderate_limit):
+    if pd.isna(value):
+        return "⚪ Data unavailable"
+    if value <= good_limit:
+        return "🟢 Good"
+    elif value <= moderate_limit:
+        return "🟡 Moderate"
+    return "🔴 High"
+
+
+# ============================================================
+# GEMINI AI FUNCTION
+# ============================================================
+
+def generate_ai_insight(
+    location_name,
+    pm25,
+    pm10,
+    no2,
+    so2,
+    o3,
+    aqi,
+    aqi_category,
+    dominant_pollutant,
+    next_hour_pm25
+):
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+        client = genai.Client(api_key=api_key)
+
+        prompt = f"""
+You are an air-quality analysis assistant.
+
+Analyze the following data for {location_name}:
+
+PM2.5: {pm25} µg/m³
+PM10: {pm10} µg/m³
+NO2: {no2} µg/m³
+SO2: {so2} µg/m³
+O3: {o3} µg/m³
+Estimated AQI: {aqi}
+AQI Category: {aqi_category}
+Dominant pollutant: {dominant_pollutant}
+Predicted next-hour PM2.5: {next_hour_pm25} µg/m³
+
+Give a concise practical interpretation.
+
+Include:
+1. Overall air-quality condition.
+2. Main pollutant concern.
+3. What the next-hour PM2.5 prediction suggests.
+4. Two practical recommendations.
+
+Use only the provided values.
+Do not diagnose medical conditions.
+Do not invent missing data.
+Keep the response under 120 words.
+"""
+
+        response = client.models.generate_content(
+            model="gemini-3.1-flash-lite",
+            contents=prompt
+        )
+
+        return response.text
+
+    except KeyError:
+        return "AI insight is unavailable because GEMINI_API_KEY is not configured in Streamlit Secrets."
+    except Exception as e:
+        return f"AI insight is temporarily unavailable: {e}"
 
 
 # ============================================================
@@ -151,11 +216,24 @@ period_days = {
     "Last 30 Days": 30
 }
 
+
 # ============================================================
-# MAIN ANALYSIS
+# INITIAL SESSION STATE
+# ============================================================
+
+if "analysis_data" not in st.session_state:
+    st.session_state.analysis_data = None
+
+if "ai_insight" not in st.session_state:
+    st.session_state.ai_insight = None
+
+
+# ============================================================
+# ANALYZE BUTTON
 # ============================================================
 
 if st.button("🔍 Analyze Air Quality"):
+    st.session_state.ai_insight = None
 
     if not location.strip():
         st.warning("Please enter a city or region.")
@@ -194,39 +272,13 @@ if st.button("🔍 Analyze Air Quality"):
 
     place = geo_data["results"][0]
 
-    place_name = place.get("name", location)
+    place_name = place.get("name", location.strip())
     country = place.get("country", "")
     latitude = place["latitude"]
     longitude = place["longitude"]
 
-    st.success(f"Location found: {place_name}, {country}")
-
     # --------------------------------------------------------
-    # 2. LOCATION INFORMATION
-    # --------------------------------------------------------
-
-    st.subheader("📍 Selected Region")
-
-    loc_col1, loc_col2, loc_col3 = st.columns(3)
-
-    with loc_col1:
-        st.metric("Region", place_name)
-
-    with loc_col2:
-        st.metric("Latitude", f"{latitude:.4f}")
-
-    with loc_col3:
-        st.metric("Longitude", f"{longitude:.4f}")
-
-    map_df = pd.DataFrame({
-        "latitude": [latitude],
-        "longitude": [longitude]
-    })
-
-    st.map(map_df)
-
-    # --------------------------------------------------------
-    # 3. AIR QUALITY DATA
+    # 2. AIR QUALITY DATA
     # --------------------------------------------------------
 
     air_url = "https://air-quality-api.open-meteo.com/v1/air-quality"
@@ -279,10 +331,7 @@ if st.button("🔍 Analyze Air Quality"):
     ]
 
     for column in pollutant_columns:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
     df = df.sort_values("time").reset_index(drop=True)
 
@@ -290,9 +339,9 @@ if st.button("🔍 Analyze Air Quality"):
         st.error("No air-quality records were returned.")
         st.stop()
 
-    # ========================================================
-    # CURRENT VALUES
-    # ========================================================
+    # --------------------------------------------------------
+    # 3. CURRENT VALUES
+    # --------------------------------------------------------
 
     latest = df.iloc[-1]
 
@@ -301,6 +350,236 @@ if st.button("🔍 Analyze Air Quality"):
     no2 = latest["nitrogen_dioxide"]
     so2 = latest["sulphur_dioxide"]
     o3 = latest["ozone"]
+
+    # --------------------------------------------------------
+    # 4. AQI ESTIMATION
+    # --------------------------------------------------------
+
+    pollutant_values = {
+        "PM2.5": pm25,
+        "PM10": pm10,
+        "NO2": no2,
+        "SO2": so2,
+        "O3": o3
+    }
+
+    sub_indices = {}
+
+    for pollutant, value in pollutant_values.items():
+        if pd.notna(value):
+            sub_indices[pollutant] = calculate_sub_index(
+                value,
+                AQI_BREAKPOINTS[pollutant]
+            )
+
+    if sub_indices:
+        overall_aqi = int(round(max(sub_indices.values())))
+        aqi_category = get_aqi_category(overall_aqi)
+        dominant_pollutant = max(sub_indices, key=sub_indices.get)
+    else:
+        overall_aqi = 0
+        aqi_category = "Unavailable"
+        dominant_pollutant = "Unavailable"
+
+    # --------------------------------------------------------
+    # 5. ML: NEXT-HOUR PM2.5
+    # --------------------------------------------------------
+
+    next_pm25 = np.nan
+    mae = np.nan
+    rmse = np.nan
+    r2 = np.nan
+
+    ml_params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": (
+            "pm2_5,pm10,nitrogen_dioxide,"
+            "sulphur_dioxide,ozone"
+        ),
+        "past_days": 30,
+        "forecast_days": 0,
+        "timezone": "auto"
+    }
+
+    try:
+        ml_response = requests.get(
+            air_url,
+            params=ml_params,
+            timeout=20
+        )
+        ml_response.raise_for_status()
+        ml_data = ml_response.json()
+    except requests.RequestException:
+        ml_data = None
+
+    if ml_data and "hourly" in ml_data:
+        ml_hourly = ml_data["hourly"]
+
+        ml_df = pd.DataFrame({
+            "time": pd.to_datetime(ml_hourly["time"]),
+            "pm2_5": ml_hourly.get("pm2_5"),
+            "pm10": ml_hourly.get("pm10"),
+            "nitrogen_dioxide": ml_hourly.get("nitrogen_dioxide"),
+            "sulphur_dioxide": ml_hourly.get("sulphur_dioxide"),
+            "ozone": ml_hourly.get("ozone")
+        })
+
+        for column in pollutant_columns:
+            ml_df[column] = pd.to_numeric(
+                ml_df[column],
+                errors="coerce"
+            )
+
+        ml_df = ml_df.sort_values("time").reset_index(drop=True)
+
+        ml_df["hour"] = ml_df["time"].dt.hour
+        ml_df["day_of_week"] = ml_df["time"].dt.dayofweek
+
+        ml_df["pm2_5_lag1"] = ml_df["pm2_5"].shift(1)
+        ml_df["pm10_lag1"] = ml_df["pm10"].shift(1)
+        ml_df["no2_lag1"] = ml_df["nitrogen_dioxide"].shift(1)
+        ml_df["so2_lag1"] = ml_df["sulphur_dioxide"].shift(1)
+        ml_df["ozone_lag1"] = ml_df["ozone"].shift(1)
+
+        features = [
+            "pm2_5",
+            "pm10",
+            "nitrogen_dioxide",
+            "sulphur_dioxide",
+            "ozone",
+            "hour",
+            "day_of_week",
+            "pm2_5_lag1",
+            "pm10_lag1",
+            "no2_lag1",
+            "so2_lag1",
+            "ozone_lag1"
+        ]
+
+        training_df = ml_df.copy()
+        training_df["target_pm2_5"] = training_df["pm2_5"].shift(-1)
+
+        training_df = training_df.dropna(
+            subset=features + ["target_pm2_5"]
+        )
+
+        if len(training_df) >= 100:
+            X = training_df[features]
+            y = training_df["target_pm2_5"]
+
+            split_index = int(len(training_df) * 0.8)
+
+            X_train = X.iloc[:split_index]
+            X_test = X.iloc[split_index:]
+            y_train = y.iloc[:split_index]
+            y_test = y.iloc[split_index:]
+
+            model = RandomForestRegressor(
+                n_estimators=200,
+                max_depth=10,
+                random_state=42
+            )
+
+            model.fit(X_train, y_train)
+
+            predictions = model.predict(X_test)
+
+            mae = mean_absolute_error(y_test, predictions)
+            rmse = np.sqrt(mean_squared_error(y_test, predictions))
+            r2 = r2_score(y_test, predictions)
+
+            latest_feature_rows = ml_df[features].dropna()
+
+            if not latest_feature_rows.empty:
+                latest_features = latest_feature_rows.iloc[[-1]]
+                next_pm25 = model.predict(latest_features)[0]
+
+    # --------------------------------------------------------
+    # SAVE ANALYSIS RESULTS
+    # --------------------------------------------------------
+
+    st.session_state.analysis_data = {
+        "place_name": place_name,
+        "country": country,
+        "latitude": latitude,
+        "longitude": longitude,
+        "df": df,
+        "pm25": pm25,
+        "pm10": pm10,
+        "no2": no2,
+        "so2": so2,
+        "o3": o3,
+        "sub_indices": sub_indices,
+        "overall_aqi": overall_aqi,
+        "aqi_category": aqi_category,
+        "dominant_pollutant": dominant_pollutant,
+        "next_pm25": next_pm25,
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2
+    }
+
+
+# ============================================================
+# DISPLAY SAVED ANALYSIS
+# ============================================================
+
+data = st.session_state.analysis_data
+
+if data is not None:
+
+    place_name = data["place_name"]
+    country = data["country"]
+    latitude = data["latitude"]
+    longitude = data["longitude"]
+    df = data["df"]
+
+    pm25 = data["pm25"]
+    pm10 = data["pm10"]
+    no2 = data["no2"]
+    so2 = data["so2"]
+    o3 = data["o3"]
+
+    sub_indices = data["sub_indices"]
+    overall_aqi = data["overall_aqi"]
+    aqi_category = data["aqi_category"]
+    dominant_pollutant = data["dominant_pollutant"]
+
+    next_pm25 = data["next_pm25"]
+    mae = data["mae"]
+    rmse = data["rmse"]
+    r2 = data["r2"]
+
+    st.success(f"Location found: {place_name}, {country}")
+
+    # --------------------------------------------------------
+    # LOCATION INFORMATION
+    # --------------------------------------------------------
+
+    st.subheader("📍 Selected Region")
+
+    loc_col1, loc_col2, loc_col3 = st.columns(3)
+
+    with loc_col1:
+        st.metric("Region", place_name)
+
+    with loc_col2:
+        st.metric("Latitude", f"{latitude:.4f}")
+
+    with loc_col3:
+        st.metric("Longitude", f"{longitude:.4f}")
+
+    map_df = pd.DataFrame({
+        "latitude": [latitude],
+        "longitude": [longitude]
+    })
+
+    st.map(map_df)
+
+    # --------------------------------------------------------
+    # CURRENT AIR QUALITY
+    # --------------------------------------------------------
 
     st.subheader("🌡️ Current Air Quality Status")
 
@@ -341,55 +620,33 @@ if st.button("🔍 Analyze Air Quality"):
         )
         st.caption(get_pollution_status(o3, 50, 100))
 
-    # ========================================================
-    # AQI ESTIMATION
-    # ========================================================
+    # --------------------------------------------------------
+    # AQI
+    # --------------------------------------------------------
 
     st.subheader("🇮🇳 National Air Quality Index")
 
-    pollutant_values = {
-        "PM2.5": pm25,
-        "PM10": pm10,
-        "NO2": no2,
-        "SO2": so2,
-        "O3": o3
-    }
+    aqi_col1, aqi_col2 = st.columns(2)
 
-    sub_indices = {}
+    with aqi_col1:
+        st.metric(
+            "Estimated AQI",
+            overall_aqi,
+            aqi_category
+        )
 
-    for pollutant, value in pollutant_values.items():
-        if pd.notna(value):
-            sub_indices[pollutant] = calculate_sub_index(
-                value,
-                AQI_BREAKPOINTS[pollutant]
+    with aqi_col2:
+        st.metric(
+            "Dominant Pollutant",
+            dominant_pollutant,
+            (
+                f"Sub-index: {sub_indices[dominant_pollutant]:.1f}"
+                if dominant_pollutant in sub_indices
+                else "Unavailable"
             )
+        )
 
     if sub_indices:
-
-        overall_aqi = int(round(max(sub_indices.values())))
-        aqi_category = get_aqi_category(overall_aqi)
-
-        aqi_col1, aqi_col2 = st.columns(2)
-
-        with aqi_col1:
-            st.metric(
-                "Estimated AQI",
-                overall_aqi,
-                aqi_category
-            )
-
-        with aqi_col2:
-            dominant_pollutant = max(
-                sub_indices,
-                key=sub_indices.get
-            )
-
-            st.metric(
-                "Dominant Pollutant",
-                dominant_pollutant,
-                f"Sub-index: {sub_indices[dominant_pollutant]:.1f}"
-            )
-
         aqi_table = pd.DataFrame({
             "Pollutant": list(sub_indices.keys()),
             "Sub-Index": [
@@ -404,17 +661,17 @@ if st.button("🔍 Analyze Air Quality"):
             hide_index=True
         )
 
-        st.info(get_aqi_message(overall_aqi))
+    st.info(get_aqi_message(overall_aqi))
 
-        st.caption(
-            "AQI shown here is an estimate based on the available "
-            "Open-Meteo hourly concentration values. It should not "
-            "be interpreted as an official CPCB monitoring-station AQI."
-        )
+    st.caption(
+        "AQI shown here is an estimate based on the available "
+        "Open-Meteo hourly concentration values. It should not "
+        "be interpreted as an official CPCB monitoring-station AQI."
+    )
 
-    # ========================================================
-    # HISTORICAL POLLUTION TRENDS
-    # ========================================================
+    # --------------------------------------------------------
+    # HISTORICAL TRENDS
+    # --------------------------------------------------------
 
     st.subheader("📈 Historical Pollution Trends")
 
@@ -433,20 +690,14 @@ if st.button("🔍 Analyze Air Quality"):
 
     st.line_chart(chart_df)
 
-    # ========================================================
+    # --------------------------------------------------------
     # SUMMARY STATISTICS
-    # ========================================================
+    # --------------------------------------------------------
 
     st.subheader("📊 Pollution Summary")
 
     summary_df = pd.DataFrame({
-        "Pollutant": [
-            "PM2.5",
-            "PM10",
-            "NO2",
-            "SO2",
-            "O3"
-        ],
+        "Pollutant": ["PM2.5", "PM10", "NO2", "SO2", "O3"],
         "Average (µg/m³)": [
             df["pm2_5"].mean(),
             df["pm10"].mean(),
@@ -463,13 +714,8 @@ if st.button("🔍 Analyze Air Quality"):
         ]
     })
 
-    summary_df["Average (µg/m³)"] = summary_df[
-        "Average (µg/m³)"
-    ].round(2)
-
-    summary_df["Maximum (µg/m³)"] = summary_df[
-        "Maximum (µg/m³)"
-    ].round(2)
+    summary_df["Average (µg/m³)"] = summary_df["Average (µg/m³)"].round(2)
+    summary_df["Maximum (µg/m³)"] = summary_df["Maximum (µg/m³)"].round(2)
 
     st.dataframe(
         summary_df,
@@ -477,9 +723,9 @@ if st.button("🔍 Analyze Air Quality"):
         hide_index=True
     )
 
-    # ========================================================
-    # ML: NEXT-HOUR PM2.5 PREDICTION
-    # ========================================================
+    # --------------------------------------------------------
+    # ML PREDICTION
+    # --------------------------------------------------------
 
     st.subheader("🤖 Next-Hour PM2.5 Prediction")
 
@@ -488,174 +734,77 @@ if st.button("🔍 Analyze Air Quality"):
         "30 days of pollutant data to estimate the next-hour PM2.5 level."
     )
 
-    ml_params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "hourly": (
-            "pm2_5,pm10,nitrogen_dioxide,"
-            "sulphur_dioxide,ozone"
-        ),
-        "past_days": 30,
-        "forecast_days": 0,
-        "timezone": "auto"
-    }
+    if pd.notna(next_pm25):
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
 
-    try:
-        ml_response = requests.get(
-            air_url,
-            params=ml_params,
-            timeout=20
+        with metric_col1:
+            st.metric(
+                "Predicted Next-Hour PM2.5",
+                f"{next_pm25:.2f} µg/m³"
+            )
+
+        with metric_col2:
+            st.metric(
+                "MAE",
+                f"{mae:.2f} µg/m³"
+            )
+
+        with metric_col3:
+            st.metric(
+                "R²",
+                f"{r2:.3f}"
+            )
+
+        st.write(f"**RMSE:** {rmse:.2f} µg/m³")
+
+        st.caption(
+            "Model: Random Forest Regressor | "
+            "80/20 chronological train-test split | "
+            "30 days of historical data"
         )
-        ml_response.raise_for_status()
-        ml_data = ml_response.json()
-    except requests.RequestException as e:
-        st.error(f"ML training data could not be retrieved: {e}")
-        ml_data = None
+    else:
+        st.warning("The next-hour PM2.5 model could not be trained for this location.")
 
-    if ml_data and "hourly" in ml_data:
+    # --------------------------------------------------------
+    # AI AIR QUALITY INSIGHTS
+    # --------------------------------------------------------
 
-        ml_hourly = ml_data["hourly"]
+    st.subheader("✨ AI Air Quality Insights")
 
-        ml_df = pd.DataFrame({
-            "time": pd.to_datetime(ml_hourly["time"]),
-            "pm2_5": ml_hourly.get("pm2_5"),
-            "pm10": ml_hourly.get("pm10"),
-            "nitrogen_dioxide": ml_hourly.get("nitrogen_dioxide"),
-            "sulphur_dioxide": ml_hourly.get("sulphur_dioxide"),
-            "ozone": ml_hourly.get("ozone")
-        })
+    st.write(
+        "Gemini provides a concise explanation of the measured pollution "
+        "levels and the Random Forest prediction. It does not replace the "
+        "prediction model."
+    )
 
-        for column in pollutant_columns:
-            ml_df[column] = pd.to_numeric(
-                ml_df[column],
-                errors="coerce"
+    if st.button("Generate AI Insight"):
+        with st.spinner("Generating AI analysis..."):
+
+            next_value_for_ai = (
+                f"{next_pm25:.2f}"
+                if pd.notna(next_pm25)
+                else "Unavailable"
             )
 
-        ml_df = ml_df.sort_values("time").reset_index(drop=True)
-
-        # Time features
-        ml_df["hour"] = ml_df["time"].dt.hour
-        ml_df["day_of_week"] = ml_df["time"].dt.dayofweek
-
-        # Lag features
-        ml_df["pm2_5_lag1"] = ml_df["pm2_5"].shift(1)
-        ml_df["pm10_lag1"] = ml_df["pm10"].shift(1)
-        ml_df["no2_lag1"] = ml_df["nitrogen_dioxide"].shift(1)
-        ml_df["so2_lag1"] = ml_df["sulphur_dioxide"].shift(1)
-        ml_df["ozone_lag1"] = ml_df["ozone"].shift(1)
-
-        features = [
-            "pm2_5",
-            "pm10",
-            "nitrogen_dioxide",
-            "sulphur_dioxide",
-            "ozone",
-            "hour",
-            "day_of_week",
-            "pm2_5_lag1",
-            "pm10_lag1",
-            "no2_lag1",
-            "so2_lag1",
-            "ozone_lag1"
-        ]
-
-        # Target = next-hour PM2.5
-        training_df = ml_df.copy()
-        training_df["target_pm2_5"] = training_df[
-            "pm2_5"
-        ].shift(-1)
-
-        training_df = training_df.dropna(
-            subset=features + ["target_pm2_5"]
-        )
-
-        if len(training_df) >= 100:
-
-            X = training_df[features]
-            y = training_df["target_pm2_5"]
-
-            # Chronological split
-            split_index = int(len(training_df) * 0.8)
-
-            X_train = X.iloc[:split_index]
-            X_test = X.iloc[split_index:]
-
-            y_train = y.iloc[:split_index]
-            y_test = y.iloc[split_index:]
-
-            model = RandomForestRegressor(
-                n_estimators=200,
-                max_depth=10,
-                random_state=42
+            st.session_state.ai_insight = generate_ai_insight(
+                place_name,
+                pm25,
+                pm10,
+                no2,
+                so2,
+                o3,
+                overall_aqi,
+                aqi_category,
+                dominant_pollutant,
+                next_value_for_ai
             )
 
-            model.fit(X_train, y_train)
+    if st.session_state.ai_insight:
+        st.info(st.session_state.ai_insight)
 
-            predictions = model.predict(X_test)
-
-            mae = mean_absolute_error(
-                y_test,
-                predictions
-            )
-
-            rmse = np.sqrt(
-                mean_squared_error(
-                    y_test,
-                    predictions
-                )
-            )
-
-            r2 = r2_score(
-                y_test,
-                predictions
-            )
-
-            # Predict the next hour using the latest available features
-            latest_feature_rows = ml_df[
-                features
-            ].dropna()
-
-            if not latest_feature_rows.empty:
-
-                latest_features = latest_feature_rows.iloc[[-1]]
-
-                next_pm25 = model.predict(
-                    latest_features
-                )[0]
-
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-
-                with metric_col1:
-                    st.metric(
-                        "Predicted Next-Hour PM2.5",
-                        f"{next_pm25:.2f} µg/m³"
-                    )
-
-                with metric_col2:
-                    st.metric(
-                        "MAE",
-                        f"{mae:.2f} µg/m³"
-                    )
-
-                with metric_col3:
-                    st.metric(
-                        "R²",
-                        f"{r2:.3f}"
-                    )
-
-                st.write(
-                    f"**RMSE:** {rmse:.2f} µg/m³"
-                )
-
-                st.caption(
-                    "Model: Random Forest Regressor | "
-                    "80/20 chronological train-test split | "
-                    "30 days of historical data"
-                )
-
-    # ========================================================
-    # ENVIRONMENTAL & COMPLIANCE INFORMATION
-    # ========================================================
+    # --------------------------------------------------------
+    # ENVIRONMENTAL & COMPLIANCE
+    # --------------------------------------------------------
 
     st.subheader("🌱 Environmental & Compliance Information")
 
@@ -672,8 +821,6 @@ if st.button("🔍 Analyze Air Quality"):
         "SO2": 80
     }
 
-    compliance_data = []
-
     compliance_values = {
         "PM2.5": pm25,
         "PM10": pm10,
@@ -681,8 +828,9 @@ if st.button("🔍 Analyze Air Quality"):
         "SO2": so2
     }
 
-    for pollutant, limit in standards.items():
+    compliance_data = []
 
+    for pollutant, limit in standards.items():
         value = compliance_values[pollutant]
 
         if pd.isna(value):
@@ -695,9 +843,7 @@ if st.button("🔍 Analyze Air Quality"):
         compliance_data.append({
             "Pollutant": pollutant,
             "Current Value (µg/m³)": (
-                round(value, 2)
-                if pd.notna(value)
-                else "N/A"
+                round(value, 2) if pd.notna(value) else "N/A"
             ),
             "NAAQS 24-hour Limit (µg/m³)": limit,
             "Status": status
@@ -716,36 +862,31 @@ if st.button("🔍 Analyze Air Quality"):
         "the relevant standard uses shorter averaging periods."
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # RECOMMENDATIONS
-    # ========================================================
+    # --------------------------------------------------------
 
     st.subheader("💡 Recommended Best Practices")
 
-    if "overall_aqi" in locals():
-
-        if overall_aqi <= 50:
-            st.success(
-                "Air quality is good. Normal outdoor activities can continue."
-            )
-
-        elif overall_aqi <= 100:
-            st.info(
-                "Air quality is satisfactory. Sensitive individuals "
-                "should monitor conditions during prolonged outdoor activity."
-            )
-
-        elif overall_aqi <= 200:
-            st.warning(
-                "Consider reducing prolonged or heavy outdoor activity, "
-                "especially for sensitive individuals."
-            )
-
-        else:
-            st.error(
-                "Pollution is high. Reduce prolonged outdoor exposure "
-                "and consider appropriate protective measures."
-            )
+    if overall_aqi <= 50:
+        st.success(
+            "Air quality is good. Normal outdoor activities can continue."
+        )
+    elif overall_aqi <= 100:
+        st.info(
+            "Air quality is satisfactory. Sensitive individuals "
+            "should monitor conditions during prolonged outdoor activity."
+        )
+    elif overall_aqi <= 200:
+        st.warning(
+            "Consider reducing prolonged or heavy outdoor activity, "
+            "especially for sensitive individuals."
+        )
+    else:
+        st.error(
+            "Pollution is high. Reduce prolonged outdoor exposure "
+            "and consider appropriate protective measures."
+        )
 
     st.markdown("""
     - 🚗 Reduce unnecessary vehicle use and prefer public transport or carpooling.
@@ -756,9 +897,9 @@ if st.button("🔍 Analyze Air Quality"):
     - 📊 Continue monitoring pollution trends to identify recurring high-pollution periods.
     """)
 
-    # ========================================================
+    # --------------------------------------------------------
     # DATA SOURCE
-    # ========================================================
+    # --------------------------------------------------------
 
     st.subheader("🔗 Data Source")
 
